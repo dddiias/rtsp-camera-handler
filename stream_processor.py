@@ -12,9 +12,10 @@ import json
 
 # Подавляем логи h264 ДО импорта cv2
 # Принудительно настраиваем FFMPEG backend с максимальным подавлением логов
+# ВАЖНО: убрали err_detect;ignore_err чтобы не пропускать битые кадры
 os.environ.setdefault(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-    "rtsp_transport;tcp|stimeout;5000000|buffer_size;1024000|loglevel;quiet|err_detect;ignore_err",
+    "rtsp_transport;tcp|stimeout;5000000|buffer_size;1024000|loglevel;quiet",
 )
 
 # Глушим логи FFmpeg/h264 через переменные окружения (до импорта cv2)
@@ -32,12 +33,32 @@ class H264ErrorFilter:
     
     def write(self, text):
         # Фильтруем все сообщения, содержащие h264 ошибки
+        if not text:
+            return
+        
         text_lower = text.lower()
-        if "h264" in text_lower and ("error" in text_lower or "decode" in text_lower or "mb" in text_lower or "bytestream" in text_lower):
-            return  # Полностью игнорируем h264 ошибки
+        
+        # Фильтруем h264 ошибки (более агрессивно)
+        if "h264" in text_lower:
+            # Игнорируем все h264 сообщения об ошибках
+            if any(keyword in text_lower for keyword in [
+                "error", "decode", "mb", "bytestream", "cabac", 
+                "missing", "reference", "picture", "reorder",
+                "mmco", "unref", "short", "failure", "illegal",
+                "buffer", "state"
+            ]):
+                return  # Полностью игнорируем h264 ошибки
+        
         # Также фильтруем другие FFmpeg ошибки
         if "ffmpeg" in text_lower and "error" in text_lower:
             return
+        
+        # Фильтруем сообщения о проблемах с декодированием
+        if any(keyword in text_lower for keyword in [
+            "decoding mb", "bytestream", "decode error"
+        ]):
+            return
+        
         # Пропускаем остальные сообщения
         self.original_stderr.write(text)
     
@@ -138,15 +159,20 @@ DEDUP_WINDOW_SECONDS = float(os.getenv("STREAM_DEDUP_WINDOW_SECONDS", "5.0"))
 # Отображение потоков (для отладки)
 SHOW_STREAM_WINDOW = os.getenv("SHOW_STREAM_WINDOW", "false").lower() == "true"
 
-def _silence_opencv_logs():
-    """Глушим логи OpenCV/FFmpeg и h264"""
+def _silence_opencv_logs() -> None:
+    """Глушим логи OpenCV/FFmpeg; учитываем разные версии OpenCV."""
     try:
+        # Новый API (OpenCV >=4.5)
         cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_SILENT)
+        return
     except Exception:
-        try:
-            cv2.setLogLevel(cv2.LOG_LEVEL_SILENT)
-        except Exception:
-            pass
+        pass
+    try:
+        # Старый API (cv2.setLogLevel)
+        cv2.setLogLevel(cv2.LOG_LEVEL_SILENT)
+    except Exception:
+        # Если нет ни одного API — просто продолжаем
+        pass
 
 _silence_opencv_logs()
 
@@ -382,6 +408,8 @@ class StreamProcessor:
         self._processing_thread: Optional[threading.Thread] = None
         self._snow_frame_buffer: deque = deque(maxlen=90)  # ~3 секунды при 30 FPS
         self._snow_buffer_lock = threading.Lock()
+        self._snow_crossing_frames: deque = deque(maxlen=10)  # Буфер кадров при пересечении линии
+        self._snow_crossing_lock = threading.Lock()
         self._processed_plates: Dict[str, float] = {}  # plate -> timestamp для дедупликации (по номеру от Gemini)
         self._plates_lock = threading.Lock()
         
@@ -476,6 +504,12 @@ class StreamProcessor:
             print(f"[STREAM] ERROR: Cannot open snow camera: {SNOW_CAMERA_RTSP}")
             return
         
+        # Устанавливаем параметры для более стабильной работы (как в стабильной версии)
+        try:
+            self.snow_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Минимальный буфер для снижения задержки
+        except Exception:
+            pass
+        
         fail_count = 0
         MAX_FAILS = 15
         
@@ -491,12 +525,56 @@ class StreamProcessor:
                 print(f"[STREAM] ⚠️ WARNING: Failed to create snow display window: {e}")
         
         while not self._stop_event.is_set():
-            ret, frame = self.snow_cap.read()
+            # Используем блокировку для безопасного чтения (как в стабильной версии)
+            ret = False
+            frame = None
+            try:
+                ret, frame = self.snow_cap.read()
+            except Exception as e:
+                print(f"[STREAM] Exception reading snow frame: {e}")
+                ret = False
+                frame = None
             
             if not ret or frame is None or frame.size == 0:
                 fail_count += 1
                 if fail_count >= MAX_FAILS:
                     print(f"[STREAM] Snow camera failed {MAX_FAILS} times, reconnecting...")
+                    self.snow_cap.release()
+                    time.sleep(2)
+                    self.snow_cap = cv2.VideoCapture(SNOW_CAMERA_RTSP, cv2.CAP_FFMPEG)
+                    fail_count = 0
+                time.sleep(0.05)
+                continue
+            
+            # Дополнительная проверка валидности кадра
+            try:
+                # Проверка формы кадра
+                if len(frame.shape) != 3 or frame.shape[2] != 3:
+                    fail_count += 1
+                    if fail_count >= MAX_FAILS:
+                        print(f"[STREAM] Snow camera: invalid frame shape {frame.shape}, reconnecting...")
+                        self.snow_cap.release()
+                        time.sleep(2)
+                        self.snow_cap = cv2.VideoCapture(SNOW_CAMERA_RTSP, cv2.CAP_FFMPEG)
+                        fail_count = 0
+                    time.sleep(0.05)
+                    continue
+                
+                # Проверка что кадр не полностью пустой
+                if np.all(frame == 0):
+                    fail_count += 1
+                    if fail_count >= MAX_FAILS:
+                        print(f"[STREAM] Snow camera: frame is all zeros, reconnecting...")
+                        self.snow_cap.release()
+                        time.sleep(2)
+                        self.snow_cap = cv2.VideoCapture(SNOW_CAMERA_RTSP, cv2.CAP_FFMPEG)
+                        fail_count = 0
+                    time.sleep(0.05)
+                    continue
+            except Exception as e:
+                print(f"[STREAM] Error validating snow frame: {e}")
+                fail_count += 1
+                if fail_count >= MAX_FAILS:
                     self.snow_cap.release()
                     time.sleep(2)
                     self.snow_cap = cv2.VideoCapture(SNOW_CAMERA_RTSP, cv2.CAP_FFMPEG)
@@ -521,13 +599,25 @@ class StreamProcessor:
                 
                 self._snow_frame_buffer.append(timestamped_frame)
             
-            # Детектируем грузовики на снеговой камере
-            detections = self._detect_vehicles(frame)
-            
+            # Детектируем грузовики на снеговой камере (только если нужно, не на каждом кадре)
+            # ВАЖНО: детекция YOLO очень тяжелая, делаем её не на каждом кадре, чтобы не блокировать чтение
+            detections = []
             crossing_tracks = []
-            if detections:
-                # Обрабатываем кадр через детектор пересечения линии
-                crossing_tracks = self.snow_detector.process_frame(frame, detections)
+            
+            # Делаем детекцию только раз в N кадров (например, каждый 3-й кадр при 30 FPS = ~10 раз в секунду)
+            # Это достаточно для трекинга, но не блокирует чтение кадров
+            if not hasattr(self, '_snow_frame_counter'):
+                self._snow_frame_counter = 0
+            self._snow_frame_counter += 1
+            
+            # Детекция каждые 3 кадра (можно настроить через переменную окружения)
+            DETECTION_INTERVAL = int(os.getenv("STREAM_DETECTION_INTERVAL", "3"))
+            if self._snow_frame_counter % DETECTION_INTERVAL == 0:
+                detections = self._detect_vehicles(frame)
+                
+                if detections:
+                    # Обрабатываем кадр через детектор пересечения линии
+                    crossing_tracks = self.snow_detector.process_frame(frame, detections)
                 
                 # Обрабатываем пересечения (когда центр грузовика пересекает линию)
                 for track in crossing_tracks:
@@ -564,7 +654,8 @@ class StreamProcessor:
                     else:
                         print(f"[STREAM] Error displaying snow frame: {e}")
             
-            time.sleep(0.01)  # Небольшая пауза
+            # Небольшая пауза, чтобы не грузить CPU (как в стабильной версии)
+            time.sleep(0.01)
         
         if SHOW_STREAM_WINDOW and snow_window_created:
             try:
@@ -582,6 +673,21 @@ class StreamProcessor:
         Если prefer_crossing=True, пытается взять кадр из буфера пересечений (когда центр пересек линию).
         Иначе берет последний кадр из общего буфера.
         """
+        def _validate_frame(frame: np.ndarray) -> bool:
+            """Проверяет валидность кадра"""
+            try:
+                if frame is None or frame.size == 0:
+                    return False
+                if len(frame.shape) != 3 or frame.shape[2] != 3:
+                    return False
+                if frame.dtype != np.uint8:
+                    return False
+                if np.all(frame == 0) or np.any(np.isnan(frame)):
+                    return False
+                return True
+            except Exception:
+                return False
+        
         # Сначала пытаемся взять кадр из буфера пересечений (когда центр пересек линию)
         if prefer_crossing:
             with self._snow_crossing_lock:
@@ -596,25 +702,65 @@ class StreamProcessor:
                             self._snow_crossing_frames.popleft()
                         else:
                             break
-                    print(f"[STREAM] Using snow frame from center crossing (track_id={crossing_data['track_id']})")
-                    return crossing_data["frame"].copy()
+                    
+                    frame = crossing_data["frame"].copy()
+                    if _validate_frame(frame):
+                        print(f"[STREAM] Using snow frame from center crossing (track_id={crossing_data['track_id']})")
+                        return frame
+                    else:
+                        print(f"[STREAM] Invalid frame from crossing buffer, trying fallback")
         
         # Fallback: берем последний кадр из общего буфера
         with self._snow_buffer_lock:
             if len(self._snow_frame_buffer) == 0:
                 return None
-            # Возвращаем последний кадр
-            return self._snow_frame_buffer[-1].frame.copy()
+            # Проверяем кадры с конца, пока не найдем валидный
+            for i in range(len(self._snow_frame_buffer) - 1, -1, -1):
+                frame = self._snow_frame_buffer[i].frame.copy()
+                if _validate_frame(frame):
+                    return frame
+            # Если все кадры битые, возвращаем None
+            print(f"[STREAM] No valid frames in snow buffer")
+            return None
     
     def _encode_frame_to_jpeg(self, frame: np.ndarray) -> Optional[bytes]:
-        """Кодирует кадр в JPEG"""
+        """Кодирует кадр в JPEG с проверкой валидности"""
         try:
+            # Проверка валидности кадра перед кодированием
+            if frame is None or frame.size == 0:
+                print(f"[STREAM] Invalid frame: None or empty")
+                return None
+            
+            # Проверка формы кадра (должна быть 3D массив: height, width, channels)
+            if len(frame.shape) != 3 or frame.shape[2] != 3:
+                print(f"[STREAM] Invalid frame shape: {frame.shape}")
+                return None
+            
+            # Проверка что кадр содержит валидные данные (не все нули или NaN)
+            if np.all(frame == 0) or np.any(np.isnan(frame)):
+                print(f"[STREAM] Invalid frame: all zeros or contains NaN")
+                return None
+            
+            # Проверка что значения пикселей в допустимом диапазоне [0, 255]
+            if frame.dtype != np.uint8:
+                print(f"[STREAM] Invalid frame dtype: {frame.dtype}, expected uint8")
+                return None
+            
             ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
             if not ok:
+                print(f"[STREAM] cv2.imencode failed")
                 return None
-            return buf.tobytes()
+            
+            encoded_bytes = buf.tobytes()
+            if len(encoded_bytes) == 0:
+                print(f"[STREAM] Encoded frame is empty")
+                return None
+            
+            return encoded_bytes
         except Exception as e:
             print(f"[STREAM] Error encoding frame: {e}")
+            import traceback
+            print(f"[STREAM] Traceback: {traceback.format_exc()}")
             return None
     
     async def _process_crossing(self, track: Track, plate_frame: np.ndarray):
@@ -787,6 +933,12 @@ class StreamProcessor:
             print(f"[STREAM] ERROR: Cannot open plate camera: {PLATE_CAMERA_RTSP}")
             return
         
+        # Устанавливаем параметры для более стабильной работы (как в стабильной версии)
+        try:
+            self.plate_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Минимальный буфер для снижения задержки
+        except Exception:
+            pass
+        
         fail_count = 0
         MAX_FAILS = 15
         
@@ -825,7 +977,15 @@ class StreamProcessor:
         asyncio.set_event_loop(loop)
         
         while not self._stop_event.is_set():
-            ret, frame = self.plate_cap.read()
+            # Используем блокировку для безопасного чтения (как в стабильной версии)
+            ret = False
+            frame = None
+            try:
+                ret, frame = self.plate_cap.read()
+            except Exception as e:
+                print(f"[STREAM] Exception reading plate frame: {e}")
+                ret = False
+                frame = None
             
             if not ret or frame is None or frame.size == 0:
                 fail_count += 1
@@ -838,17 +998,66 @@ class StreamProcessor:
                 time.sleep(0.05)
                 continue
             
+            # Дополнительная проверка валидности кадра
+            try:
+                # Проверка формы кадра
+                if len(frame.shape) != 3 or frame.shape[2] != 3:
+                    fail_count += 1
+                    if fail_count >= MAX_FAILS:
+                        print(f"[STREAM] Plate camera: invalid frame shape {frame.shape}, reconnecting...")
+                        self.plate_cap.release()
+                        time.sleep(2)
+                        self.plate_cap = cv2.VideoCapture(PLATE_CAMERA_RTSP, cv2.CAP_FFMPEG)
+                        fail_count = 0
+                    time.sleep(0.05)
+                    continue
+                
+                # Проверка что кадр не полностью пустой
+                if np.all(frame == 0):
+                    fail_count += 1
+                    if fail_count >= MAX_FAILS:
+                        print(f"[STREAM] Plate camera: frame is all zeros, reconnecting...")
+                        self.plate_cap.release()
+                        time.sleep(2)
+                        self.plate_cap = cv2.VideoCapture(PLATE_CAMERA_RTSP, cv2.CAP_FFMPEG)
+                        fail_count = 0
+                    time.sleep(0.05)
+                    continue
+            except Exception as e:
+                print(f"[STREAM] Error validating plate frame: {e}")
+                fail_count += 1
+                if fail_count >= MAX_FAILS:
+                    self.plate_cap.release()
+                    time.sleep(2)
+                    self.plate_cap = cv2.VideoCapture(PLATE_CAMERA_RTSP, cv2.CAP_FFMPEG)
+                    fail_count = 0
+                time.sleep(0.05)
+                continue
+            
             fail_count = 0
             
-            # Детектируем машины
-            detections = self._detect_vehicles(frame)
-            
+            # Детектируем машины (только если нужно, не на каждом кадре)
+            # ВАЖНО: детекция YOLO очень тяжелая, делаем её не на каждом кадре, чтобы не блокировать чтение
+            detections = []
             crossing_tracks = []
-            if detections:
-                # Обрабатываем кадр через детектор пересечения линии (номерной камеры)
-                crossing_tracks = self.plate_detector.process_frame(frame, detections)
+            
+            # Делаем детекцию только раз в N кадров (например, каждый 3-й кадр при 30 FPS = ~10 раз в секунду)
+            # Это достаточно для трекинга, но не блокирует чтение кадров
+            if not hasattr(self, '_plate_frame_counter'):
+                self._plate_frame_counter = 0
+            self._plate_frame_counter += 1
+            
+            # Детекция каждые 3 кадра (можно настроить через переменную окружения)
+            DETECTION_INTERVAL = int(os.getenv("STREAM_DETECTION_INTERVAL", "3"))
+            if self._plate_frame_counter % DETECTION_INTERVAL == 0:
+                detections = self._detect_vehicles(frame)
                 
-                # Обрабатываем пересечения
+                if detections:
+                    # Обрабатываем кадр через детектор пересечения линии (номерной камеры)
+                    crossing_tracks = self.plate_detector.process_frame(frame, detections)
+            
+            # Обрабатываем пересечения (даже если детекция была пропущена, треки продолжают работать)
+            if crossing_tracks:
                 for track in crossing_tracks:
                     if track.crossed:
                         print(f"[STREAM] Line crossing detected: track_id={track.track_id}, bbox={track.bbox}")
@@ -873,7 +1082,8 @@ class StreamProcessor:
                     else:
                         print(f"[STREAM] Error displaying frame: {e}")
             
-            time.sleep(0.01)  # Небольшая пауза
+            # Небольшая пауза, чтобы не грузить CPU (как в стабильной версии)
+            time.sleep(0.01)
         
         loop.close()
         
